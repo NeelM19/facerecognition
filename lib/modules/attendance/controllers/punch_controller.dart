@@ -1,0 +1,393 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:camera/camera.dart';
+import 'package:face_detection_tflite/face_detection_tflite_native.dart';
+import 'package:facerecognition/core/constants/app_constants.dart';
+import 'package:facerecognition/core/logging/app_logger.dart';
+import 'package:facerecognition/data/models/attendance_record.dart';
+import 'package:facerecognition/data/repositories/attendance_repository.dart';
+import 'package:facerecognition/data/repositories/profile_repository.dart';
+import 'package:facerecognition/routes/app_routes.dart';
+import 'package:facerecognition/services/face_recognition_service.dart';
+import 'package:facerecognition/services/liveness_tracker.dart';
+import 'package:get/get.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+class PunchController extends GetxController {
+  PunchController({
+    required ProfileRepository profileRepository,
+    required AttendanceRepository attendanceRepository,
+    required FaceRecognitionService faceRecognitionService,
+  })  : _profileRepository = profileRepository,
+        _attendanceRepository = attendanceRepository,
+        _faceService = faceRecognitionService;
+
+  final ProfileRepository _profileRepository;
+  final AttendanceRepository _attendanceRepository;
+  final FaceRecognitionService _faceService;
+
+  static const _stableFaceHitsRequired = 3;
+  static const _cooldown = Duration(seconds: 4);
+  /// Faster sampling during liveness so short blinks are not skipped.
+  static const _livenessFrameGap = Duration(milliseconds: 90);
+  static const _matchFrameGap = Duration(milliseconds: 280);
+
+  final isCameraReady = false.obs;
+  final isProcessing = false.obs;
+  final isCapturing = false.obs;
+  final permissionDenied = false.obs;
+  final faceInView = false.obs;
+  final livenessPassed = false.obs;
+  final livenessPrompt = ''.obs;
+  final statusMessage = 'Look at the camera to punch'.obs;
+  final lastResult = Rxn<AttendanceRecord>();
+  final nextType = AttendanceType.clockIn.obs;
+  final lastSimilarity = RxnDouble();
+
+  /// Stable-face progress toward auto punch (0..1).
+  final stableProgress = 0.0.obs;
+
+  CameraController? cameraController;
+  List<double>? _referenceEmbedding;
+  List<double>? _maskedReferenceEmbedding;
+  List<List<double>> _appearanceEmbeddings = const [];
+
+  bool _streamActive = false;
+  bool _frameBusy = false;
+  int _stableHits = 0;
+  DateTime? _cooldownUntil;
+  DateTime? _lastFrameAt;
+  bool _closed = false;
+
+  late LivenessTracker _liveness;
+
+  @override
+  void onReady() {
+    super.onReady();
+    _bootstrap();
+  }
+
+  void _resetLiveness() {
+    _liveness = LivenessTracker();
+    livenessPassed.value = false;
+    livenessPrompt.value = LivenessTracker.instruction;
+  }
+
+  Future<void> _bootstrap() async {
+    try {
+      final profile = await _profileRepository.getProfile();
+      if (!profile.isEnrolled || profile.embedding == null) {
+        statusMessage.value = 'No enrolled face found';
+        Get.snackbar('Missing face', 'Please enroll your face first');
+        return;
+      }
+      _referenceEmbedding = profile.embedding;
+      _maskedReferenceEmbedding = profile.maskedEmbedding;
+      _appearanceEmbeddings = profile.appearanceEmbeddings;
+      nextType.value = await _attendanceRepository.nextPunchType();
+      _resetLiveness();
+      statusMessage.value =
+          '${LivenessTracker.instruction} · then auto ${nextType.value.label}';
+      await _initCamera();
+    } catch (e, st) {
+      AppLogger.error('Punch bootstrap failed', e, st);
+      statusMessage.value = 'Unable to prepare punch screen';
+    }
+  }
+
+  Future<void> _initCamera() async {
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      permissionDenied.value = true;
+      statusMessage.value = 'Camera permission is required';
+      return;
+    }
+
+    try {
+      final cameras = await availableCameras();
+      final front = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+
+      final controller = CameraController(
+        front,
+        ResolutionPreset.high,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+      if (_closed) {
+        await controller.dispose();
+        return;
+      }
+      cameraController = controller;
+      isCameraReady.value = true;
+      await _startAutoDetection();
+    } catch (e, st) {
+      AppLogger.error('Punch camera init failed', e, st);
+      statusMessage.value = 'Unable to start camera';
+      Get.snackbar('Camera error', e.toString());
+    }
+  }
+
+  Future<void> _startAutoDetection() async {
+    final controller = cameraController;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (_streamActive || controller.value.isStreamingImages) return;
+
+    await controller.startImageStream(_onCameraFrame);
+    _streamActive = true;
+    statusMessage.value = livenessPassed.value
+        ? 'Scanning… hold still for ${nextType.value.label}'
+        : LivenessTracker.instruction;
+  }
+
+  Future<void> _stopAutoDetection() async {
+    final controller = cameraController;
+    if (controller == null) return;
+    if (!_streamActive && !controller.value.isStreamingImages) return;
+
+    try {
+      await controller.stopImageStream();
+    } catch (_) {}
+    _streamActive = false;
+  }
+
+  Future<void> _onCameraFrame(CameraImage image) async {
+    if (_closed || _frameBusy || isProcessing.value) return;
+
+    final now = DateTime.now();
+    final minGap =
+        livenessPassed.value ? _matchFrameGap : _livenessFrameGap;
+    if (_lastFrameAt != null && now.difference(_lastFrameAt!) < minGap) {
+      return;
+    }
+    _lastFrameAt = now;
+
+    if (_cooldownUntil != null && now.isBefore(_cooldownUntil!)) {
+      faceInView.value = false;
+      return;
+    }
+
+    _frameBusy = true;
+    try {
+      final controller = cameraController;
+      if (controller == null) return;
+
+      final rotation = rotationForFrame(
+        width: image.width,
+        height: image.height,
+        sensorOrientation: controller.description.sensorOrientation,
+        isFrontCamera:
+            controller.description.lensDirection == CameraLensDirection.front,
+        deviceOrientation: controller.value.deviceOrientation,
+      );
+
+      // Full mode: eye open probs (blink) + head yaw (turn).
+      final faces = await _faceService.detectFromCameraImage(
+        image,
+        rotation: rotation,
+        mode: FaceDetectionMode.full,
+      );
+
+      if (_closed || isProcessing.value) return;
+
+      Face? face;
+      for (final f in faces) {
+        if (f.score >= AppConstants.punchMinFaceScore &&
+            f.widthFraction >=
+                AppConstants.punchMinFaceWidthFraction * 0.9) {
+          face = f;
+          break;
+        }
+      }
+      faceInView.value = face != null;
+
+      if (face == null) {
+        _stableHits = 0;
+        stableProgress.value = 0;
+        if (!isProcessing.value &&
+            (_cooldownUntil == null || now.isAfter(_cooldownUntil!))) {
+          statusMessage.value = livenessPassed.value
+              ? 'Align face — auto ${nextType.value.label}'
+              : LivenessTracker.instruction;
+        }
+        return;
+      }
+
+      if (!livenessPassed.value) {
+        final done = _liveness.observe(
+          leftEyeOpen: face.leftEyeOpenProbability,
+          rightEyeOpen: face.rightEyeOpenProbability,
+          yawDegrees: face.headEulerAngleY,
+        );
+        final eye = _liveness.lastEyeOpen;
+        final eyeTxt = eye == null ? 'n/a' : eye.toStringAsFixed(2);
+        statusMessage.value =
+            '${_liveness.blinkHint} (eyes $eyeTxt) · or turn head';
+        if (done) {
+          livenessPassed.value = true;
+          final how = _liveness.passMethod == LivenessPassMethod.blink
+              ? 'blink'
+              : 'head turn';
+          statusMessage.value =
+              'Liveness OK ($how) — hold still for ${nextType.value.label}';
+          Get.snackbar(
+            'Liveness passed',
+            'Detected $how',
+            snackPosition: SnackPosition.BOTTOM,
+            duration: const Duration(seconds: 1),
+          );
+        }
+        _stableHits = 0;
+        stableProgress.value = 0;
+        return;
+      }
+
+      _stableHits++;
+      stableProgress.value = _stableHits / _stableFaceHitsRequired;
+      statusMessage.value =
+          'Face confirmed… ($_stableHits/$_stableFaceHitsRequired)';
+
+      if (_stableHits >= _stableFaceHitsRequired) {
+        _stableHits = 0;
+        await _autoPunch();
+      }
+    } catch (e, st) {
+      AppLogger.error('Auto detect frame failed', e, st);
+    } finally {
+      _frameBusy = false;
+    }
+  }
+
+  Future<void> _autoPunch() async {
+    final controller = cameraController;
+    final reference = _referenceEmbedding;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (reference == null || isProcessing.value) return;
+    if (!livenessPassed.value) return;
+
+    isProcessing.value = true;
+    stableProgress.value = 1;
+    statusMessage.value = 'Capturing…';
+
+    try {
+      await _stopAutoDetection();
+      isCapturing.value = true;
+      await Future<void>.delayed(const Duration(milliseconds: 140));
+
+      final file = await controller.takePicture();
+      isCapturing.value = false;
+      statusMessage.value = 'Recognizing…';
+      final bytes = await File(file.path).readAsBytes();
+
+      final match = await _faceService.matchFromBytes(
+        photoBytes: bytes,
+        referenceEmbedding: reference,
+        maskedReferenceEmbedding: _maskedReferenceEmbedding,
+        appearanceEmbeddings: _appearanceEmbeddings,
+      );
+      lastSimilarity.value = match.similarity;
+
+      print(
+        '[AUTO_PUNCH] match => matched=${match.matched} '
+        'sim=${match.similarity} dist=${match.distance} '
+        'template=${match.matchedTemplate?.name}',
+      );
+
+      if (!match.matched) {
+        statusMessage.value =
+            'Not matched · sim ${match.similarity.toStringAsFixed(2)} · '
+            'dist ${match.distance.toStringAsFixed(2)}';
+        Get.snackbar('Not recognized', statusMessage.value);
+        _resetLiveness();
+        _startCooldown();
+        return;
+      }
+
+      if (match.similarity >= AppConstants.appearanceAdaptMinSimilarity &&
+          match.distance <= AppConstants.appearanceAdaptMaxDistance) {
+        try {
+          final updated =
+              await _profileRepository.upsertAppearanceEmbedding(
+            match.embedding,
+          );
+          _appearanceEmbeddings = updated.appearanceEmbeddings;
+        } catch (e, st) {
+          AppLogger.error('Appearance gallery adapt failed', e, st);
+        }
+      }
+
+      final type = await _attendanceRepository.nextPunchType();
+      final record = await _attendanceRepository.recordPunch(
+        type: type,
+        similarity: match.similarity,
+        matched: true,
+        distance: match.distance,
+        embedding: match.embedding,
+      );
+
+      lastResult.value = record;
+      nextType.value = await _attendanceRepository.nextPunchType();
+      final modelNote = match.matchedTemplate == null
+          ? ''
+          : ' · ${match.matchedTemplate!.name} model';
+      statusMessage.value =
+          'Punched ${record.type.label} · sim ${match.similarity.toStringAsFixed(2)} · '
+          'dist ${match.distance.toStringAsFixed(2)}$modelNote';
+
+      _closed = true;
+      await _stopAutoDetection();
+      Get.offAllNamed(AppRoutes.dashboard);
+      Get.snackbar(
+        'Attendance marked',
+        statusMessage.value,
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    } catch (e, st) {
+      print('[AUTO_PUNCH] error => $e');
+      AppLogger.error('Auto punch failed', e, st);
+      statusMessage.value = e.toString().replaceFirst('Bad state: ', '');
+      Get.snackbar('Punch failed', statusMessage.value);
+      _resetLiveness();
+      _startCooldown();
+    } finally {
+      isProcessing.value = false;
+      isCapturing.value = false;
+      faceInView.value = false;
+      if (!_closed) {
+        stableProgress.value = 0;
+        await _startAutoDetection();
+      }
+    }
+  }
+
+  void _startCooldown() {
+    _cooldownUntil = DateTime.now().add(_cooldown);
+    statusMessage.value =
+        'Next scan in ${_cooldown.inSeconds}s — '
+        '${LivenessTracker.instruction}';
+  }
+
+  Future<void> openAppSettingsPage() => openAppSettings();
+
+  @override
+  void onClose() {
+    _closed = true;
+    final controller = cameraController;
+    cameraController = null;
+    if (controller != null) {
+      unawaited(() async {
+        try {
+          if (controller.value.isStreamingImages) {
+            await controller.stopImageStream();
+          }
+        } catch (_) {}
+        await controller.dispose();
+      }());
+    }
+    super.onClose();
+  }
+}
