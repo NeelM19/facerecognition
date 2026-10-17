@@ -247,6 +247,9 @@ class EnrollController extends GetxController {
     statusMessage.value =
         hasMask ? 'Clear + masked face enrolled' : 'Clear face enrolled';
 
+    // Release camera before navigating so punch can open the same lens.
+    await _releaseCamera();
+
     if (fromSettings) {
       Get.back(result: saved);
     } else {
@@ -261,10 +264,21 @@ class EnrollController extends GetxController {
 
   Future<void> openAppSettingsPage() => openAppSettings();
 
+  Future<void> _releaseCamera() async {
+    isCameraReady.value = false;
+    final controller = cameraController;
+    cameraController = null;
+    if (controller == null) return;
+    try {
+      await controller.dispose();
+    } catch (e, st) {
+      AppLogger.error('Enroll camera dispose failed', e, st);
+    }
+  }
+
   @override
   void onClose() {
-    cameraController?.dispose();
-    cameraController = null;
+    unawaited(_releaseCamera());
     super.onClose();
   }
 }

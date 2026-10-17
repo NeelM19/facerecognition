@@ -104,32 +104,56 @@ class PunchController extends GetxController {
       return;
     }
 
-    try {
-      final cameras = await availableCameras();
-      final front = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
-      );
+    const maxAttempts = 3;
+    Object? lastError;
+    StackTrace? lastStack;
 
-      final controller = CameraController(
-        front,
-        ResolutionPreset.high,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-      );
-      await controller.initialize();
-      if (_closed) {
-        await controller.dispose();
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (_closed) return;
+
+      CameraController? controller;
+      try {
+        final cameras = await availableCameras();
+        final front = cameras.firstWhere(
+          (c) => c.lensDirection == CameraLensDirection.front,
+          orElse: () => cameras.first,
+        );
+
+        controller = CameraController(
+          front,
+          ResolutionPreset.high,
+          enableAudio: false,
+          imageFormatGroup: ImageFormatGroup.yuv420,
+        );
+        await controller.initialize();
+        if (_closed) {
+          await controller.dispose();
+          return;
+        }
+        cameraController = controller;
+        isCameraReady.value = true;
+        await _startAutoDetection();
         return;
+      } catch (e, st) {
+        lastError = e;
+        lastStack = st;
+        AppLogger.error(
+          'Punch camera init failed (attempt $attempt/$maxAttempts)',
+          e,
+          st,
+        );
+        try {
+          await controller?.dispose();
+        } catch (_) {}
+        if (attempt < maxAttempts) {
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+        }
       }
-      cameraController = controller;
-      isCameraReady.value = true;
-      await _startAutoDetection();
-    } catch (e, st) {
-      AppLogger.error('Punch camera init failed', e, st);
-      statusMessage.value = 'Unable to start camera';
-      Get.snackbar('Camera error', e.toString());
     }
+
+    AppLogger.error('Punch camera init failed', lastError, lastStack);
+    statusMessage.value = 'Unable to start camera';
+    Get.snackbar('Camera error', lastError.toString());
   }
 
   Future<void> _startAutoDetection() async {
