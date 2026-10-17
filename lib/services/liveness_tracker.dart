@@ -7,20 +7,19 @@ enum _LivenessStep { blink, turnLeft, turnRight }
 
 /// Challenge-response anti-spoofing.
 ///
-/// A still photo / gallery image held to the camera previously passed because:
-/// - blink used nearly identical open/closed gates (noise looked like a blink)
-/// - OR a tiny ~12° phone tilt counted as a head turn
-///
-/// This tracker requires **both** a real blink **and** a directed head turn
-/// (random left/right), with stricter thresholds and a return-to-center.
+/// Requires **both** a real blink **and** a directed head turn (random
+/// left/right), with session timeout, static-image rejection, and a mesh
+/// depth-spread check that soft-fails phone-tilt / flat-photo spoofs.
 class LivenessTracker {
   LivenessTracker({math.Random? random}) : _random = random ?? math.Random() {
+    _startedAt = DateTime.now();
     _buildChallengeOrder();
   }
 
   final math.Random _random;
 
   bool completed = false;
+  bool timedOut = false;
   LivenessPassMethod? passMethod;
 
   /// Current user-facing instruction for the active challenge.
@@ -43,6 +42,7 @@ class LivenessTracker {
 
   late List<_LivenessStep> _steps;
   int _stepIndex = 0;
+  late DateTime _startedAt;
 
   // --- Blink state ---
   bool _blinkSawOpen = false;
@@ -63,8 +63,13 @@ class LivenessTracker {
   double? _prevYaw;
   double? _prevFaceCx;
   double? _prevFaceCy;
+  double _lastYawDelta = 0;
   double _motionBudget = 0;
   int _staticFrames = 0;
+
+  // --- Mesh flatness while turning ---
+  double? _prevDepthSpread;
+  int _flatWhileTurningFrames = 0;
 
   // Glasses-friendly gates: absolute levels are softer; a relative drop from
   // the user's own open baseline is what confirms a blink (specs often never
@@ -82,9 +87,42 @@ class LivenessTracker {
   static const _minFrontalFrames = 2;
   static const _minTargetFrames = 3;
 
+  /// Fail the whole challenge session if not completed in time.
+  static const challengeTimeout = Duration(seconds: 14);
+
   /// Reject if face pose barely changes while a motion challenge is active.
   static const _staticFrameLimit = 45;
   static const _minMotionForTurn = 6.0;
+
+  /// Normalized mesh z-spread below this while yaw is large ⇒ likely flat spoof.
+  static const _minDepthSpreadWhileTurning = 1.8;
+  static const _flatWhileTurningLimit = 10;
+  /// Yaw changing but depth spread almost unchanged ⇒ phone tilt.
+  static const _yawDeltaForFlatCheck = 2.5;
+  static const _depthDeltaMinWhileYawing = 0.08;
+
+  /// Scale-normalized std-dev of mesh z (face-width units × 100).
+  /// Returns null when mesh / size is insufficient.
+  static double? meshDepthSpread({
+    required Iterable<double?> zs,
+    required double faceWidthPx,
+  }) {
+    if (faceWidthPx < 8) return null;
+    var sum = 0.0;
+    var sumSq = 0.0;
+    var n = 0;
+    for (final z in zs) {
+      if (z == null) continue;
+      sum += z;
+      sumSq += z * z;
+      n++;
+    }
+    if (n < 40) return null;
+    final mean = sum / n;
+    final variance = (sumSq / n) - (mean * mean);
+    final std = math.sqrt(variance.abs());
+    return (std / faceWidthPx) * 100.0;
+  }
 
   void _buildChallengeOrder() {
     final turn =
@@ -101,7 +139,9 @@ class LivenessTracker {
 
   void resetProgress() {
     completed = false;
+    timedOut = false;
     passMethod = null;
+    _startedAt = DateTime.now();
     _blinkSawOpen = false;
     _blinkSawClosed = false;
     _openFrames = 0;
@@ -116,8 +156,11 @@ class LivenessTracker {
     _prevYaw = null;
     _prevFaceCx = null;
     _prevFaceCy = null;
+    _lastYawDelta = 0;
     _motionBudget = 0;
     _staticFrames = 0;
+    _prevDepthSpread = null;
+    _flatWhileTurningFrames = 0;
     lastEyeOpen = null;
     blinkHint = 'Look at the camera with eyes open';
     _buildChallengeOrder();
@@ -162,21 +205,33 @@ class LivenessTracker {
     _targetFrames = 0;
     _staticFrames = 0;
     _motionBudget = 0;
+    _prevDepthSpread = null;
+    _flatWhileTurningFrames = 0;
     _syncPrompt();
   }
 
   /// Feed one face observation. Returns true when liveness just completed.
   ///
   /// Optional [faceCenterX]/[faceCenterY] (normalized 0..1) improve the
-  /// static-photo heuristic when available.
+  /// static-photo heuristic. [meshDepthSpread] (from [meshDepthSpread]) soft-
+  /// fails flat phone-tilt spoofs during head-turn challenges.
   bool observe({
     required double? leftEyeOpen,
     required double? rightEyeOpen,
     required double? yawDegrees,
     double? faceCenterX,
     double? faceCenterY,
+    double? meshDepthSpread,
   }) {
     if (completed) return false;
+    if (timedOut) return false;
+
+    if (DateTime.now().difference(_startedAt) > challengeTimeout) {
+      timedOut = true;
+      blinkHint = 'Timed out — blink + turn again';
+      prompt = blinkHint;
+      return false;
+    }
 
     _trackMotion(
       yawDegrees: yawDegrees,
@@ -185,6 +240,14 @@ class LivenessTracker {
     );
 
     final step = _currentStep;
+    if (step != _LivenessStep.blink &&
+        _rejectFlatMeshSpoof(
+          yawDegrees: yawDegrees,
+          meshDepthSpread: meshDepthSpread,
+        )) {
+      return false;
+    }
+
     final done = switch (step) {
       _LivenessStep.blink => _observeBlink(leftEyeOpen, rightEyeOpen),
       _LivenessStep.turnLeft =>
@@ -210,6 +273,43 @@ class LivenessTracker {
     return completed;
   }
 
+  /// Returns true when the turn challenge was soft-reset due to flat mesh.
+  bool _rejectFlatMeshSpoof({
+    required double? yawDegrees,
+    required double? meshDepthSpread,
+  }) {
+    if (yawDegrees == null || meshDepthSpread == null) {
+      _prevDepthSpread = meshDepthSpread;
+      return false;
+    }
+
+    final yawAbs = yawDegrees.abs();
+    final prevSpread = _prevDepthSpread;
+    _prevDepthSpread = meshDepthSpread;
+
+    // Large yaw with very flat inferred depth ⇒ printed/phone face.
+    final flatPose =
+        yawAbs >= _targetYaw * 0.7 && meshDepthSpread < _minDepthSpreadWhileTurning;
+
+    // Yaw changing but depth geometry barely changes ⇒ rigid plane (phone).
+    final rigidTilt = _lastYawDelta >= _yawDeltaForFlatCheck &&
+        prevSpread != null &&
+        (meshDepthSpread - prevSpread).abs() < _depthDeltaMinWhileYawing;
+
+    if (flatPose || rigidTilt) {
+      _flatWhileTurningFrames++;
+      if (_flatWhileTurningFrames >= _flatWhileTurningLimit) {
+        _resetTurnOnly();
+        blinkHint = 'Live face required — flat image rejected';
+        prompt = blinkHint;
+        return true;
+      }
+    } else {
+      _flatWhileTurningFrames = 0;
+    }
+    return false;
+  }
+
   void _resetTurnOnly() {
     _turnSawFrontal = false;
     _turnSawTarget = false;
@@ -217,6 +317,8 @@ class LivenessTracker {
     _targetFrames = 0;
     _staticFrames = 0;
     _motionBudget = 0;
+    _flatWhileTurningFrames = 0;
+    _prevDepthSpread = null;
     _syncPrompt();
   }
 
@@ -226,8 +328,10 @@ class LivenessTracker {
     double? faceCenterY,
   }) {
     var delta = 0.0;
+    _lastYawDelta = 0;
     if (yawDegrees != null && _prevYaw != null) {
-      delta += (yawDegrees - _prevYaw!).abs();
+      _lastYawDelta = (yawDegrees - _prevYaw!).abs();
+      delta += _lastYawDelta;
     }
     if (faceCenterX != null && _prevFaceCx != null) {
       delta += (faceCenterX - _prevFaceCx!).abs() * 80;

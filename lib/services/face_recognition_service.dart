@@ -6,6 +6,7 @@ import 'package:face_detection_tflite/face_detection_tflite_native.dart';
 import 'package:facerecognition/core/config/match_threshold_config.dart';
 import 'package:facerecognition/core/constants/app_constants.dart';
 import 'package:facerecognition/core/logging/app_logger.dart';
+import 'package:facerecognition/services/face_pad_service.dart';
 import 'package:facerecognition/services/image_quality_service.dart';
 import 'package:get/get.dart';
 
@@ -49,12 +50,17 @@ class FaceRecognitionService extends GetxService {
   FaceRecognitionService({
     MatchThresholdStore? thresholdStore,
     ImageQualityService? imageQualityService,
+    FacePadService? facePadService,
   })  : _thresholdStore = thresholdStore,
-        _quality = imageQualityService ?? ImageQualityService();
+        _quality = imageQualityService ?? ImageQualityService(),
+        _pad = facePadService;
 
   FaceDetector? _detector;
   MatchThresholdStore? _thresholdStore;
   final ImageQualityService _quality;
+  FacePadService? _pad;
+
+  void bindPadService(FacePadService pad) => _pad = pad;
 
   MatchThresholdConfig get thresholds =>
       _thresholdStore?.load() ?? MatchThresholdConfig.defaults;
@@ -134,6 +140,7 @@ class FaceRecognitionService extends GetxService {
           ? AppConstants.punchMinFaceWidthFraction
           : AppConstants.minFaceWidthFraction,
     );
+    await _requireLivePad(photoBytes, face);
     final embedding = _l2Normalize(
       await _fd.getFaceEmbedding(face, photoBytes),
     );
@@ -160,13 +167,25 @@ class FaceRecognitionService extends GetxService {
     List<double>? maskedReferenceEmbedding,
     List<List<double>> appearanceEmbeddings = const [],
   }) async {
-    final quality = await _quality.assess(photoBytes);
-    if (quality.tooDark || quality.tooBlurry) {
+    final quality = await _quality.assess(
+      photoBytes,
+      checkScreenOrPrint: true,
+    );
+    if (quality.likelyScreenOrPrint ||
+        quality.tooDark ||
+        quality.tooBlurry) {
       throw StateError(
         quality.rejectionReason ??
             'Punch photo quality too low. Hold still in good light.',
       );
     }
+    AppLogger.punch(
+      'quality luma=${quality.meanLuma.toStringAsFixed(1)} '
+      'sharp=${quality.sharpness.toStringAsFixed(1)} '
+      'stripe=${quality.screenStripeScore.toStringAsFixed(1)} '
+      'moire=${quality.moireScore.toStringAsFixed(2)} '
+      'screen=${quality.likelyScreenOrPrint}',
+    );
 
     final face = _selectBestFace(
       await detectFromBytes(photoBytes),
@@ -174,6 +193,7 @@ class FaceRecognitionService extends GetxService {
       minScore: AppConstants.punchMinFaceScore,
       minWidthFraction: AppConstants.punchMinFaceWidthFraction,
     );
+    await _requireLivePad(photoBytes, face);
     final live = _l2Normalize(
       await _fd.getFaceEmbedding(face, photoBytes),
     );
@@ -361,6 +381,26 @@ class FaceRecognitionService extends GetxService {
       maxDist: config.clearMaxDistance,
       occlusionTolerant: false,
     );
+  }
+
+  /// Runs MiniFASNetV2 PAD on the face crop; rejects photo/screen/video spoofs.
+  Future<void> _requireLivePad(Uint8List photoBytes, Face face) async {
+    final pad = _pad;
+    if (pad == null || !pad.isReady) {
+      AppLogger.info('PAD skipped — service not ready');
+      return;
+    }
+    final box = face.detectionData.boundingBox;
+    final result = await pad.assessBytes(
+      photoBytes: photoBytes,
+      xmin: box.xmin,
+      ymin: box.ymin,
+      xmax: box.xmax,
+      ymax: box.ymax,
+    );
+    if (!result.isLive) {
+      throw StateError(result.rejectionReason);
+    }
   }
 
   bool _looksOccludedOrCovered(Face face) {

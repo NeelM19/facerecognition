@@ -34,6 +34,8 @@ class PunchController extends GetxController {
   static const _matchFrameGap = Duration(milliseconds: 280);
   /// Lose the face this many frames → restart liveness (blocks photo swap).
   static const _faceLostResetFrames = 4;
+  /// After liveness passes, punch must happen quickly or challenges restart.
+  static const _livenessFreshFor = Duration(seconds: 4);
 
   final isCameraReady = false.obs;
   final isProcessing = false.obs;
@@ -42,6 +44,8 @@ class PunchController extends GetxController {
   final faceInView = false.obs;
   final livenessPassed = false.obs;
   final livenessPrompt = ''.obs;
+  /// Short, user-facing instruction shown on the punch screen.
+  final userPrompt = 'Center your face in the circle'.obs;
   final statusMessage = 'Look at the camera to punch'.obs;
   final lastResult = Rxn<AttendanceRecord>();
   final nextType = AttendanceType.clockIn.obs;
@@ -61,6 +65,7 @@ class PunchController extends GetxController {
   int _faceLostFrames = 0;
   DateTime? _cooldownUntil;
   DateTime? _lastFrameAt;
+  DateTime? _livenessPassedAt;
   bool _closed = false;
 
   LivenessTracker _liveness = LivenessTracker();
@@ -75,10 +80,58 @@ class PunchController extends GetxController {
     _liveness = LivenessTracker();
     livenessPassed.value = false;
     livenessPrompt.value = _liveness.prompt;
+    _livenessPassedAt = null;
     _stableHits = 0;
     stableProgress.value = 0;
     _faceLostFrames = 0;
-    statusMessage.value = reason ?? _liveness.prompt;
+    final msg = reason ?? _friendlyLivenessHint(_liveness.prompt);
+    statusMessage.value = msg;
+    userPrompt.value = msg;
+  }
+
+  /// Maps internal liveness hints to short UI copy (no debug / jargon).
+  String _friendlyLivenessHint(String raw) {
+    final t = raw.toLowerCase();
+    if (t.contains('timed out') || t.contains('expired')) {
+      return 'Let’s try again — follow the next step';
+    }
+    if (t.contains('static') || t.contains('flat') || t.contains('spoof')) {
+      return 'Use your live face, not a photo';
+    }
+    if (t.contains('blink')) {
+      if (t.contains('seen') || t.contains('open your eyes again')) {
+        return 'Nice — open your eyes again';
+      }
+      if (t.contains('ok')) return 'Blink done — next step';
+      return 'Blink naturally';
+    }
+    if (t.contains('left')) {
+      if (t.contains('wrong')) return 'Turn left';
+      if (t.contains('face the camera again') || t.contains('good')) {
+        return 'Good — face the camera again';
+      }
+      return 'Turn your head left, then look at the camera';
+    }
+    if (t.contains('right')) {
+      if (t.contains('wrong')) return 'Turn right';
+      if (t.contains('face the camera again') || t.contains('good')) {
+        return 'Good — face the camera again';
+      }
+      return 'Turn your head right, then look at the camera';
+    }
+    if (t.contains('face lost') || t.contains('keep your face')) {
+      return 'Keep your face in the circle';
+    }
+    if (t.contains('closer')) return 'Move a little closer';
+    if (t.contains('straight') || t.contains('face the camera')) {
+      return 'Look straight at the camera';
+    }
+    if (raw.trim().isEmpty) return 'Center your face in the circle';
+    // Fall back to raw prompt when already short/clear.
+    if (raw.length <= 48 && !raw.contains('·') && !raw.contains('eyes')) {
+      return raw;
+    }
+    return 'Follow the on-screen step';
   }
 
   Future<void> _bootstrap() async {
@@ -94,12 +147,13 @@ class PunchController extends GetxController {
       _appearanceEmbeddings = profile.appearanceEmbeddings;
       nextType.value = await _attendanceRepository.nextPunchType();
       _resetLiveness();
-      statusMessage.value =
-          '${_liveness.prompt} · then auto ${nextType.value.label}';
+      userPrompt.value = _friendlyLivenessHint(_liveness.prompt);
+      statusMessage.value = userPrompt.value;
       await _initCamera();
     } catch (e, st) {
       AppLogger.error('Punch bootstrap failed', e, st);
       statusMessage.value = 'Unable to prepare punch screen';
+      userPrompt.value = 'Something went wrong — go back and try again';
     }
   }
 
@@ -170,9 +224,10 @@ class PunchController extends GetxController {
 
     await controller.startImageStream(_onCameraFrame);
     _streamActive = true;
-    statusMessage.value = livenessPassed.value
-        ? 'Scanning… hold still for ${nextType.value.label}'
-        : _liveness.prompt;
+    userPrompt.value = livenessPassed.value
+        ? 'Hold still…'
+        : _friendlyLivenessHint(_liveness.prompt);
+    statusMessage.value = userPrompt.value;
   }
 
   Future<void> _stopAutoDetection() async {
@@ -216,7 +271,7 @@ class PunchController extends GetxController {
         deviceOrientation: controller.value.deviceOrientation,
       );
 
-      // Full mode: eye open probs (blink) + head yaw (turn).
+      // Full mode: eye open probs (blink) + head yaw (turn) + mesh depth.
       final faces = await _faceService.detectFromCameraImage(
         image,
         rotation: rotation,
@@ -244,45 +299,61 @@ class PunchController extends GetxController {
         // liveness restart so a photo cannot be swapped in after a live pass.
         if (_faceLostFrames >= _faceLostResetFrames &&
             (livenessPassed.value || _liveness.hasProgress)) {
-          _resetLiveness(
-            reason: 'Face lost — ${_liveness.prompt}',
-          );
+          _resetLiveness(reason: 'Keep your face in the circle');
         } else if (!isProcessing.value &&
             (_cooldownUntil == null || now.isAfter(_cooldownUntil!))) {
-          statusMessage.value = livenessPassed.value
-              ? 'Keep your face in view'
-              : _liveness.prompt;
+          userPrompt.value = livenessPassed.value
+              ? 'Keep your face in the circle'
+              : _friendlyLivenessHint(_liveness.prompt);
+          statusMessage.value = userPrompt.value;
         }
         return;
       }
 
       _faceLostFrames = 0;
 
+      // Freshness: must capture soon after challenges pass.
+      if (livenessPassed.value &&
+          _livenessPassedAt != null &&
+          now.difference(_livenessPassedAt!) > _livenessFreshFor) {
+        _resetLiveness(reason: 'Let’s try again — follow the next step');
+        return;
+      }
+
       if (!livenessPassed.value) {
         final box = face.detectionData.boundingBox;
+        final faceWidthPx =
+            (box.xmax - box.xmin).abs() * face.originalSize.width;
+        final depthSpread = face.mesh == null
+            ? null
+            : LivenessTracker.meshDepthSpread(
+                zs: face.mesh!.points.map((p) => p.z),
+                faceWidthPx: faceWidthPx,
+              );
+
         final done = _liveness.observe(
           leftEyeOpen: face.leftEyeOpenProbability,
           rightEyeOpen: face.rightEyeOpenProbability,
           yawDegrees: face.headEulerAngleY,
           faceCenterX: (box.xmin + box.xmax) * 0.5,
           faceCenterY: (box.ymin + box.ymax) * 0.5,
+          meshDepthSpread: depthSpread,
         );
         livenessPrompt.value = _liveness.prompt;
-        final eye = _liveness.lastEyeOpen;
-        final eyeTxt = eye == null ? 'n/a' : eye.toStringAsFixed(2);
-        // Prefer the live challenge hint; after blink completes the next
-        // challenge prompt is already in blinkHint / prompt.
-        statusMessage.value = '${_liveness.blinkHint} (eyes $eyeTxt)';
+        userPrompt.value = _friendlyLivenessHint(_liveness.blinkHint);
+        statusMessage.value = userPrompt.value;
+
+        if (_liveness.timedOut) {
+          _resetLiveness(reason: 'Let’s try again — follow the next step');
+          _startCooldown();
+          return;
+        }
+
         if (done) {
           livenessPassed.value = true;
-          statusMessage.value =
-              'Liveness OK — hold still for ${nextType.value.label}';
-          Get.snackbar(
-            'Liveness passed',
-            'Hold still to punch',
-            snackPosition: SnackPosition.BOTTOM,
-            duration: const Duration(seconds: 1),
-          );
+          _livenessPassedAt = now;
+          userPrompt.value = 'Hold still…';
+          statusMessage.value = userPrompt.value;
           // Start stable-face countdown on the same frame so punch is not delayed.
           _stableHits = 1;
           stableProgress.value = _stableHits / _stableFaceHitsRequired;
@@ -295,8 +366,8 @@ class PunchController extends GetxController {
 
       _stableHits++;
       stableProgress.value = _stableHits / _stableFaceHitsRequired;
-      statusMessage.value =
-          'Face confirmed… ($_stableHits/$_stableFaceHitsRequired)';
+      userPrompt.value = 'Hold still…';
+      statusMessage.value = userPrompt.value;
 
       if (_stableHits >= _stableFaceHitsRequired) {
         _stableHits = 0;
@@ -316,13 +387,21 @@ class PunchController extends GetxController {
     if (reference == null || isProcessing.value) return;
     // Hard gate: never punch without a completed live challenge session.
     if (!livenessPassed.value || !_liveness.completed) {
-      _resetLiveness(reason: 'Complete liveness first — ${_liveness.prompt}');
+      _resetLiveness(reason: _friendlyLivenessHint(_liveness.prompt));
+      return;
+    }
+
+    final passedAt = _livenessPassedAt;
+    if (passedAt == null ||
+        DateTime.now().difference(passedAt) > _livenessFreshFor) {
+      _resetLiveness(reason: 'Let’s try again — follow the next step');
       return;
     }
 
     isProcessing.value = true;
     stableProgress.value = 1;
-    statusMessage.value = 'Capturing…';
+    userPrompt.value = 'Almost done…';
+    statusMessage.value = userPrompt.value;
 
     try {
       await _stopAutoDetection();
@@ -331,7 +410,8 @@ class PunchController extends GetxController {
 
       final file = await controller.takePicture();
       isCapturing.value = false;
-      statusMessage.value = 'Recognizing…';
+      userPrompt.value = 'Verifying…';
+      statusMessage.value = userPrompt.value;
       final bytes = await File(file.path).readAsBytes();
 
       final match = await _faceService.matchFromBytes(
@@ -349,10 +429,13 @@ class PunchController extends GetxController {
       );
 
       if (!match.matched) {
-        statusMessage.value =
-            'Not matched · sim ${match.similarity.toStringAsFixed(2)} · '
-            'dist ${match.distance.toStringAsFixed(2)}';
-        Get.snackbar('Not recognized', statusMessage.value);
+        userPrompt.value = 'Face not recognized — try again';
+        statusMessage.value = userPrompt.value;
+        Get.snackbar(
+          'Not recognized',
+          'Make sure you are enrolled and look at the camera',
+          snackPosition: SnackPosition.BOTTOM,
+        );
         _resetLiveness();
         _startCooldown();
         return;
@@ -382,26 +465,31 @@ class PunchController extends GetxController {
 
       lastResult.value = record;
       nextType.value = await _attendanceRepository.nextPunchType();
-      final modelNote = match.matchedTemplate == null
-          ? ''
-          : ' · ${match.matchedTemplate!.name} model';
-      statusMessage.value =
-          'Punched ${record.type.label} · sim ${match.similarity.toStringAsFixed(2)} · '
-          'dist ${match.distance.toStringAsFixed(2)}$modelNote';
+      final successMsg = record.type == AttendanceType.clockIn
+          ? 'Checked in successfully'
+          : 'Checked out successfully';
+      userPrompt.value = successMsg;
+      statusMessage.value = successMsg;
 
       _closed = true;
       await _stopAutoDetection();
       Get.offAllNamed(AppRoutes.dashboard);
       Get.snackbar(
         'Attendance marked',
-        statusMessage.value,
+        successMsg,
         snackPosition: SnackPosition.BOTTOM,
       );
     } catch (e, st) {
       print('[AUTO_PUNCH] error => $e');
       AppLogger.error('Auto punch failed', e, st);
-      statusMessage.value = e.toString().replaceFirst('Bad state: ', '');
-      Get.snackbar('Punch failed', statusMessage.value);
+      final raw = e.toString().replaceFirst('Bad state: ', '');
+      final friendly = raw.toLowerCase().contains('spoof') ||
+              raw.toLowerCase().contains('pad')
+          ? 'Use your live face — photos and videos are blocked'
+          : (raw.length > 80 ? 'Couldn’t verify — try again' : raw);
+      userPrompt.value = friendly;
+      statusMessage.value = friendly;
+      Get.snackbar('Couldn’t punch', friendly, snackPosition: SnackPosition.BOTTOM);
       _resetLiveness();
       _startCooldown();
     } finally {
@@ -417,8 +505,9 @@ class PunchController extends GetxController {
 
   void _startCooldown() {
     _cooldownUntil = DateTime.now().add(_cooldown);
-    statusMessage.value =
-        'Next scan in ${_cooldown.inSeconds}s — ${_liveness.prompt}';
+    userPrompt.value =
+        'Wait ${_cooldown.inSeconds}s, then try again';
+    statusMessage.value = userPrompt.value;
   }
 
   Future<void> openAppSettingsPage() => openAppSettings();

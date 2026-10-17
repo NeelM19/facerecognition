@@ -13,6 +13,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   get: ^4.7.3
   face_detection_tflite: ^6.10.1
+  flutter_litert: ^3.9.2
   camera: ^0.12.1
   sqflite: ^2.4.2
   path: ^1.9.1
@@ -29,3 +30,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/models/silentface.tflite

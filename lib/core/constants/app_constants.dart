@@ -66,4 +66,15 @@ class AppConstants {
 
   /// Prefix for unique enrolled photo files: enrolled_face_TIMESTAMP.jpg
   static const String enrolledPhotoFilePrefix = 'enrolled_face_';
+
+  /// MiniFASNetV2 silent-face PAD asset (LiteRT / TFLite).
+  static const String padModelAsset = 'assets/models/silentface.tflite';
+
+  /// Face crop scale relative to detector box (Silent-Face MiniFASNetV2 = 2.7).
+  static const double padCropScale = 2.7;
+
+  /// Softmax class-1 (live) score required to accept a punch / enroll still.
+  /// Dual-scale ensemble (2.7+4.0) usually lands live faces well above this.
+  /// Raise toward 0.85 for stricter anti-replay; lower if genuine rejects rise.
+  static const double padMinLiveScore = 0.70;
 }

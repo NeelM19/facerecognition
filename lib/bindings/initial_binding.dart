@@ -7,6 +7,7 @@ import 'package:facerecognition/data/remote/face_sync_port.dart';
 import 'package:facerecognition/data/remote/noop_face_sync_client.dart';
 import 'package:facerecognition/data/repositories/attendance_repository.dart';
 import 'package:facerecognition/data/repositories/profile_repository.dart';
+import 'package:facerecognition/services/face_pad_service.dart';
 import 'package:facerecognition/services/face_recognition_service.dart';
 import 'package:facerecognition/services/image_quality_service.dart';
 import 'package:get/get.dart';
@@ -18,11 +19,13 @@ class InitialBinding extends Bindings {
     required this.faceRecognitionService,
     required this.thresholdStore,
     required this.imageQualityService,
+    required this.facePadService,
   });
 
   final FaceRecognitionService faceRecognitionService;
   final MatchThresholdStore thresholdStore;
   final ImageQualityService imageQualityService;
+  final FacePadService facePadService;
 
   @override
   void dependencies() {
@@ -33,6 +36,7 @@ class InitialBinding extends Bindings {
     Get.put(AttendanceLocalDatasource(Get.find()), permanent: true);
     Get.put(imageQualityService, permanent: true);
     Get.put(thresholdStore, permanent: true);
+    Get.put<FacePadService>(facePadService, permanent: true);
     // Face service before ProfileRepository (gallery merge uses it).
     Get.put<FaceRecognitionService>(faceRecognitionService, permanent: true);
     Get.put(

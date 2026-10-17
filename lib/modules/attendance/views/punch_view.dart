@@ -45,9 +45,12 @@ class PunchView extends GetView<PunchController> {
         final capturing = controller.isCapturing.value;
         final faceInView = controller.faceInView.value;
         final progress = controller.stableProgress.value;
-        final showProgress = faceInView &&
-            controller.livenessPassed.value &&
-            (progress > 0 || processing);
+        final livenessOk = controller.livenessPassed.value;
+        final showProgress =
+            faceInView && livenessOk && (progress > 0 || processing);
+        final nextLabel = controller.nextType.value == AttendanceType.clockIn
+            ? 'Checking in'
+            : 'Checking out';
 
         return Padding(
           padding: const EdgeInsets.all(16),
@@ -71,40 +74,32 @@ class PunchView extends GetView<PunchController> {
                   progress: showProgress ? progress.clamp(0.0, 1.0) : null,
                   ovalCenterYFactor: 0.45,
                 ),
+                // Single status chip — punch type only.
                 Positioned(
                   left: 20,
                   right: 20,
                   top: 20,
-                  child: Column(
-                    children: [
-                      _GlassBadge(
-                        label: 'Next · ${controller.nextType.value.label}',
-                        accent: scheme.primary,
-                      ),
-                      const SizedBox(height: 8),
-                      _GlassBadge(
-                        label: controller.livenessPassed.value
-                            ? (processing
-                                ? 'Verifying identity…'
-                                : 'Liveness verified')
-                            : (controller.livenessPrompt.value.isEmpty
-                                ? 'Complete blink + head turn'
-                                : controller.livenessPrompt.value),
-                        accent: controller.livenessPassed.value
-                            ? const Color(0xFF5CE1C5)
-                            : const Color(0xFFFFB74D),
-                      ),
-                    ],
+                  child: Align(
+                    alignment: Alignment.topCenter,
+                    child: _StatusChip(
+                      label: nextLabel,
+                      accent: scheme.primary,
+                    ),
                   ),
                 ),
+                // One clear instruction at the bottom (no duplicates / jargon).
                 Positioned(
-                  left: 24,
-                  right: 24,
-                  bottom: 20,
-                  child: _GlassBadge(
-                    label: controller.statusMessage.value,
-                    accent: Colors.white24,
-                    multiline: true,
+                  left: 20,
+                  right: 20,
+                  bottom: 24,
+                  child: _InstructionCard(
+                    title: controller.userPrompt.value,
+                    subtitle: livenessOk
+                        ? 'Keep your face in the circle'
+                        : 'Use your live face — photos won’t work',
+                    accent: livenessOk
+                        ? const Color(0xFF5CE1C5)
+                        : const Color(0xFFFFB74D),
                   ),
                 ),
               ],
@@ -116,40 +111,82 @@ class PunchView extends GetView<PunchController> {
   }
 }
 
-class _GlassBadge extends StatelessWidget {
-  const _GlassBadge({
-    required this.label,
-    required this.accent,
-    this.multiline = false,
-  });
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({required this.label, required this.accent});
 
   final String label;
   final Color accent;
-  final bool multiline;
 
   @override
   Widget build(BuildContext context) {
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: const Color(0x990A1210),
-        borderRadius: BorderRadius.circular(16),
+        color: const Color(0xCC0A1210),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: accent.withValues(alpha: 0.4)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.95),
+            fontWeight: FontWeight.w600,
+            fontSize: 13,
+            letterSpacing: 0.2,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InstructionCard extends StatelessWidget {
+  const _InstructionCard({
+    required this.title,
+    required this.subtitle,
+    required this.accent,
+  });
+
+  final String title;
+  final String subtitle;
+  final Color accent;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: const Color(0xE60A1210),
+        borderRadius: BorderRadius.circular(18),
         border: Border.all(color: accent.withValues(alpha: 0.35)),
       ),
       child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: multiline ? 16 : 14,
-          vertical: multiline ? 12 : 9,
-        ),
-        child: Text(
-          label,
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: Colors.white.withValues(alpha: 0.94),
-            fontWeight: FontWeight.w500,
-            letterSpacing: 0.25,
-            height: multiline ? 1.35 : 1.2,
-            fontSize: multiline ? 13.5 : 12.5,
-          ),
+        padding: const EdgeInsets.fromLTRB(18, 14, 18, 14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+                fontSize: 16,
+                height: 1.3,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              subtitle,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.72),
+                fontWeight: FontWeight.w400,
+                fontSize: 13,
+                height: 1.35,
+              ),
+            ),
+          ],
         ),
       ),
     );
