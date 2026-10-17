@@ -87,7 +87,9 @@ class PunchView extends GetView<PunchController> {
                             ? (processing
                                 ? 'Verifying identity…'
                                 : 'Liveness verified')
-                            : controller.statusMessage.value,
+                            : (controller.livenessPrompt.value.isEmpty
+                                ? 'Complete blink + head turn'
+                                : controller.livenessPrompt.value),
                         accent: controller.livenessPassed.value
                             ? const Color(0xFF5CE1C5)
                             : const Color(0xFFFFB74D),

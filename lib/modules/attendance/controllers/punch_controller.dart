@@ -27,11 +27,13 @@ class PunchController extends GetxController {
   final AttendanceRepository _attendanceRepository;
   final FaceRecognitionService _faceService;
 
-  static const _stableFaceHitsRequired = 3;
+  static const _stableFaceHitsRequired = 2;
   static const _cooldown = Duration(seconds: 4);
-  /// Faster sampling during liveness so short blinks are not skipped.
-  static const _livenessFrameGap = Duration(milliseconds: 90);
+  /// Faster sampling during liveness so short blinks (esp. with glasses) are caught.
+  static const _livenessFrameGap = Duration(milliseconds: 55);
   static const _matchFrameGap = Duration(milliseconds: 280);
+  /// Lose the face this many frames → restart liveness (blocks photo swap).
+  static const _faceLostResetFrames = 4;
 
   final isCameraReady = false.obs;
   final isProcessing = false.obs;
@@ -56,11 +58,12 @@ class PunchController extends GetxController {
   bool _streamActive = false;
   bool _frameBusy = false;
   int _stableHits = 0;
+  int _faceLostFrames = 0;
   DateTime? _cooldownUntil;
   DateTime? _lastFrameAt;
   bool _closed = false;
 
-  late LivenessTracker _liveness;
+  LivenessTracker _liveness = LivenessTracker();
 
   @override
   void onReady() {
@@ -68,10 +71,14 @@ class PunchController extends GetxController {
     _bootstrap();
   }
 
-  void _resetLiveness() {
+  void _resetLiveness({String? reason}) {
     _liveness = LivenessTracker();
     livenessPassed.value = false;
-    livenessPrompt.value = LivenessTracker.instruction;
+    livenessPrompt.value = _liveness.prompt;
+    _stableHits = 0;
+    stableProgress.value = 0;
+    _faceLostFrames = 0;
+    statusMessage.value = reason ?? _liveness.prompt;
   }
 
   Future<void> _bootstrap() async {
@@ -88,7 +95,7 @@ class PunchController extends GetxController {
       nextType.value = await _attendanceRepository.nextPunchType();
       _resetLiveness();
       statusMessage.value =
-          '${LivenessTracker.instruction} · then auto ${nextType.value.label}';
+          '${_liveness.prompt} · then auto ${nextType.value.label}';
       await _initCamera();
     } catch (e, st) {
       AppLogger.error('Punch bootstrap failed', e, st);
@@ -165,7 +172,7 @@ class PunchController extends GetxController {
     _streamActive = true;
     statusMessage.value = livenessPassed.value
         ? 'Scanning… hold still for ${nextType.value.label}'
-        : LivenessTracker.instruction;
+        : _liveness.prompt;
   }
 
   Future<void> _stopAutoDetection() async {
@@ -232,38 +239,54 @@ class PunchController extends GetxController {
       if (face == null) {
         _stableHits = 0;
         stableProgress.value = 0;
-        if (!isProcessing.value &&
+        _faceLostFrames++;
+        // Dropping the face mid-challenge (or after pass) forces a full
+        // liveness restart so a photo cannot be swapped in after a live pass.
+        if (_faceLostFrames >= _faceLostResetFrames &&
+            (livenessPassed.value || _liveness.hasProgress)) {
+          _resetLiveness(
+            reason: 'Face lost — ${_liveness.prompt}',
+          );
+        } else if (!isProcessing.value &&
             (_cooldownUntil == null || now.isAfter(_cooldownUntil!))) {
           statusMessage.value = livenessPassed.value
-              ? 'Align face — auto ${nextType.value.label}'
-              : LivenessTracker.instruction;
+              ? 'Keep your face in view'
+              : _liveness.prompt;
         }
         return;
       }
 
+      _faceLostFrames = 0;
+
       if (!livenessPassed.value) {
+        final box = face.detectionData.boundingBox;
         final done = _liveness.observe(
           leftEyeOpen: face.leftEyeOpenProbability,
           rightEyeOpen: face.rightEyeOpenProbability,
           yawDegrees: face.headEulerAngleY,
+          faceCenterX: (box.xmin + box.xmax) * 0.5,
+          faceCenterY: (box.ymin + box.ymax) * 0.5,
         );
+        livenessPrompt.value = _liveness.prompt;
         final eye = _liveness.lastEyeOpen;
         final eyeTxt = eye == null ? 'n/a' : eye.toStringAsFixed(2);
-        statusMessage.value =
-            '${_liveness.blinkHint} (eyes $eyeTxt) · or turn head';
+        // Prefer the live challenge hint; after blink completes the next
+        // challenge prompt is already in blinkHint / prompt.
+        statusMessage.value = '${_liveness.blinkHint} (eyes $eyeTxt)';
         if (done) {
           livenessPassed.value = true;
-          final how = _liveness.passMethod == LivenessPassMethod.blink
-              ? 'blink'
-              : 'head turn';
           statusMessage.value =
-              'Liveness OK ($how) — hold still for ${nextType.value.label}';
+              'Liveness OK — hold still for ${nextType.value.label}';
           Get.snackbar(
             'Liveness passed',
-            'Detected $how',
+            'Hold still to punch',
             snackPosition: SnackPosition.BOTTOM,
             duration: const Duration(seconds: 1),
           );
+          // Start stable-face countdown on the same frame so punch is not delayed.
+          _stableHits = 1;
+          stableProgress.value = _stableHits / _stableFaceHitsRequired;
+          return;
         }
         _stableHits = 0;
         stableProgress.value = 0;
@@ -291,7 +314,11 @@ class PunchController extends GetxController {
     final reference = _referenceEmbedding;
     if (controller == null || !controller.value.isInitialized) return;
     if (reference == null || isProcessing.value) return;
-    if (!livenessPassed.value) return;
+    // Hard gate: never punch without a completed live challenge session.
+    if (!livenessPassed.value || !_liveness.completed) {
+      _resetLiveness(reason: 'Complete liveness first — ${_liveness.prompt}');
+      return;
+    }
 
     isProcessing.value = true;
     stableProgress.value = 1;
@@ -391,8 +418,7 @@ class PunchController extends GetxController {
   void _startCooldown() {
     _cooldownUntil = DateTime.now().add(_cooldown);
     statusMessage.value =
-        'Next scan in ${_cooldown.inSeconds}s — '
-        '${LivenessTracker.instruction}';
+        'Next scan in ${_cooldown.inSeconds}s — ${_liveness.prompt}';
   }
 
   Future<void> openAppSettingsPage() => openAppSettings();
